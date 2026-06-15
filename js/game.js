@@ -53,6 +53,8 @@ class UndergroundRadioGame {
                 repairDone: [],
                 rumorSuppressDone: []
             },
+            alertHistory: [],
+            todayAlertCount: 0,
             gameOver: false
         };
     }
@@ -105,6 +107,8 @@ class UndergroundRadioGame {
         if (saved) {
             try {
                 this.gameState = JSON.parse(saved);
+                if (!this.gameState.alertHistory) this.gameState.alertHistory = [];
+                if (this.gameState.todayAlertCount === undefined) this.gameState.todayAlertCount = 0;
                 this.showEvent('读取存档', '成功读取游戏存档！', []);
             } catch (e) {
                 this.gameState = this.getDefaultState();
@@ -146,6 +150,9 @@ class UndergroundRadioGame {
                 this.gameState.thresholds[stat] = parseInt(e.target.value);
                 valSpan.textContent = e.target.value;
                 this.renderStatus();
+                this.renderAlertCenter();
+                this.renderSchedule();
+                this.updateEndDayButtonAlert();
             });
         });
 
@@ -175,6 +182,8 @@ class UndergroundRadioGame {
         this.renderRumors();
         this.renderSettlements();
         this.renderThresholds();
+        this.renderAlertCenter();
+        this.updateEndDayButtonAlert();
     }
 
     renderStatus() {
@@ -284,14 +293,40 @@ class UndergroundRadioGame {
                 if (this.gameState.schedule[slot] === program.id) {
                     btn.classList.add('selected');
                 }
+
+                const simulated = this.simulateEffects(this.gameState.status, program.effects, program.power);
+                const alerts = this.getCurrentAlerts(simulated, this.gameState.thresholds);
+                const currentAlerts = this.getCurrentAlerts(this.gameState.status, this.gameState.thresholds);
+                const levelOrder = { warning: 1, danger: 2, critical: 3 };
+
+                let newRiskLevel = null;
+                alerts.forEach(a => {
+                    const existing = currentAlerts.find(ca => ca.stat === a.stat);
+                    if (!existing || levelOrder[a.level] > levelOrder[existing.level]) {
+                        if (!newRiskLevel || levelOrder[a.level] > levelOrder[newRiskLevel]) {
+                            newRiskLevel = a.level;
+                        }
+                    }
+                });
+
+                if (newRiskLevel) {
+                    btn.classList.add(`risk-${newRiskLevel}`);
+                }
                 
                 const effectsText = Object.entries(program.effects)
                     .map(([k, v]) => `${this.getStatName(k)} ${v > 0 ? '+' : ''}${v}`)
                     .join(', ');
+
+                let riskTagHtml = '';
+                if (newRiskLevel) {
+                    const riskNames = { warning: '有风险', danger: '高风险', critical: '极危险' };
+                    riskTagHtml = `<div class="program-risk-tag ${newRiskLevel}">⚠ ${riskNames[newRiskLevel]}</div>`;
+                }
                 
                 btn.innerHTML = `
                     <div>${program.name}</div>
                     <div class="program-effects">${effectsText} | ⚡${program.power}</div>
+                    ${riskTagHtml}
                 `;
                 
                 btn.addEventListener('click', () => this.selectProgram(slot, program.id));
@@ -492,9 +527,359 @@ class UndergroundRadioGame {
         return names[stat] || stat;
     }
 
+    getAlertLevel(value, threshold, isLowerBetter) {
+        const breach = isLowerBetter 
+            ? Math.max(0, threshold - value)
+            : Math.max(0, value - threshold);
+        
+        if (breach === 0) return null;
+        
+        const percentage = (breach / threshold) * 100;
+        if (percentage <= 15) return { level: 'warning', name: '警告', icon: '⚠️' };
+        if (percentage <= 40) return { level: 'danger', name: '危险', icon: '🚨' };
+        return { level: 'critical', name: '严重', icon: '💥' };
+    }
+
+    getCurrentAlerts(status, thresholds) {
+        const alerts = [];
+        const statConfigs = [
+            { stat: 'power', isLowerBetter: true, dangerMsg: '电量不足可能导致设备停机' },
+            { stat: 'noise', isLowerBetter: false, dangerMsg: '噪声过高会影响居民休息' },
+            { stat: 'rumor', isLowerBetter: false, dangerMsg: '谣言泛滥将动摇民心' },
+            { stat: 'fatigue', isLowerBetter: false, dangerMsg: '幸存者疲劳过度影响工作效率' },
+            { stat: 'morale', isLowerBetter: true, dangerMsg: '民心低迷可能导致信任危机' }
+        ];
+
+        statConfigs.forEach(config => {
+            const value = status[config.stat];
+            const threshold = thresholds[config.stat];
+            const alertInfo = this.getAlertLevel(value, threshold, config.isLowerBetter);
+            
+            if (alertInfo) {
+                alerts.push({
+                    stat: config.stat,
+                    value: value,
+                    threshold: threshold,
+                    level: alertInfo.level,
+                    levelName: alertInfo.name,
+                    icon: alertInfo.icon,
+                    message: config.dangerMsg,
+                    statName: this.getStatName(config.stat),
+                    breach: config.isLowerBetter ? threshold - value : value - threshold
+                });
+            }
+        });
+
+        return alerts;
+    }
+
+    getHighestAlertLevel(alerts) {
+        if (alerts.length === 0) return null;
+        const levelOrder = { warning: 1, danger: 2, critical: 3 };
+        return alerts.reduce((highest, alert) => 
+            levelOrder[alert.level] > levelOrder[highest.level] ? alert : highest
+        );
+    }
+
+    simulateEffects(baseStatus, effects, extraPower = 0) {
+        const simulated = { ...baseStatus };
+        Object.entries(effects).forEach(([key, value]) => {
+            if (simulated[key] !== undefined) {
+                simulated[key] = Math.max(0, Math.min(100, simulated[key] + value));
+            }
+        });
+        if (extraPower > 0) {
+            simulated.power = Math.max(0, simulated.power - extraPower);
+        }
+        return simulated;
+    }
+
+    checkActionAlerts(actionName, actionDesc, baseStatus, thresholds, effects, extraPower = 0) {
+        const simulatedStatus = this.simulateEffects(baseStatus, effects, extraPower);
+        const currentAlerts = this.getCurrentAlerts(baseStatus, thresholds);
+        const newAlerts = this.getCurrentAlerts(simulatedStatus, thresholds);
+        
+        const worsenedAlerts = [];
+        const levelOrder = { warning: 1, danger: 2, critical: 3 };
+        
+        newAlerts.forEach(newAlert => {
+            const existing = currentAlerts.find(a => a.stat === newAlert.stat);
+            if (!existing) {
+                worsenedAlerts.push({ ...newAlert, changeType: 'new' });
+            } else if (levelOrder[newAlert.level] > levelOrder[existing.level]) {
+                worsenedAlerts.push({ ...newAlert, changeType: 'escalated', fromLevel: existing.levelName });
+            }
+        });
+
+        if (worsenedAlerts.length > 0) {
+            this.recordAlerts(actionName, actionDesc, worsenedAlerts, baseStatus, simulatedStatus);
+        }
+
+        return worsenedAlerts;
+    }
+
+    recordAlerts(actionName, actionDesc, alerts, beforeStatus, afterStatus) {
+        const levelOrder = { warning: 1, danger: 2, critical: 3 };
+        const highest = alerts.reduce((h, a) => 
+            levelOrder[a.level] > levelOrder[h.level] ? a : h
+        );
+
+        const details = alerts.map(a => {
+            const before = beforeStatus[a.stat];
+            const after = afterStatus[a.stat];
+            const change = (after - before).toFixed(0);
+            const changeStr = change > 0 ? `+${change}` : change;
+            const changeInfo = a.changeType === 'new' 
+                ? `[新增预警]` 
+                : `[升级: ${a.fromLevel}→${a.levelName}]`;
+            return `${a.statName}: ${before}→${after} (${changeStr}) ${changeInfo}`;
+        }).join(' | ');
+
+        const alertRecord = {
+            id: 'alert_' + Date.now() + '_' + Math.random(),
+            timestamp: Date.now(),
+            day: this.gameState.day,
+            action: actionName,
+            actionDesc: actionDesc,
+            level: highest.level,
+            levelName: highest.levelName,
+            icon: highest.icon,
+            message: `执行「${actionDesc}」将触发${alerts.length}项预警`,
+            details: details,
+            alerts: alerts,
+            beforeStatus: { ...beforeStatus },
+            afterStatus: { ...afterStatus }
+        };
+
+        this.gameState.alertHistory.unshift(alertRecord);
+        if (this.gameState.alertHistory.length > 50) {
+            this.gameState.alertHistory = this.gameState.alertHistory.slice(0, 50);
+        }
+        this.gameState.todayAlertCount++;
+
+        this.showAlertPopup(alertRecord);
+    }
+
+    showAlertPopup(alertRecord) {
+        let banner = document.querySelector('.warning-banner');
+        if (!banner) {
+            banner = document.createElement('div');
+            banner.className = 'warning-banner';
+            document.body.appendChild(banner);
+        }
+
+        const popup = document.createElement('div');
+        popup.className = `warning-popup ${alertRecord.level}`;
+        popup.style.position = 'relative';
+        
+        const alertList = alertRecord.alerts.map(a => 
+            `• ${a.icon} ${a.statName}: 当前${Math.round(a.value)}/阈值${a.threshold} (${a.message})`
+        ).join('<br>');
+
+        popup.innerHTML = `
+            <button class="warning-popup-close">×</button>
+            <div class="warning-popup-header">
+                <span class="warning-popup-icon">${alertRecord.icon}</span>
+                <span>${alertRecord.levelName}预警 - ${alertRecord.action}</span>
+            </div>
+            <div class="warning-popup-message">
+                <strong>操作：</strong>${alertRecord.actionDesc}<br>
+                ${alertRecord.message}
+            </div>
+            <div class="warning-popup-details">
+                ${alertList}
+            </div>
+        `;
+
+        banner.appendChild(popup);
+
+        popup.querySelector('.warning-popup-close').addEventListener('click', () => {
+            popup.style.animation = 'warningFade 0.3s ease forwards';
+            setTimeout(() => popup.remove(), 300);
+        });
+
+        setTimeout(() => {
+            if (popup.parentNode) {
+                popup.style.animation = 'warningFade 0.4s ease forwards';
+                setTimeout(() => popup.remove(), 400);
+            }
+        }, 6000);
+    }
+
+    renderAlertCenter() {
+        const { status, thresholds, alertHistory, todayAlertCount } = this.gameState;
+        const currentAlerts = this.getCurrentAlerts(status, thresholds);
+        const highest = this.getHighestAlertLevel(currentAlerts);
+
+        const panel = document.getElementById('alertPanel');
+        const indicator = document.getElementById('alertIndicator');
+        const statusText = document.getElementById('alertStatusText');
+        const countNum = document.getElementById('alertCountNum');
+
+        panel.classList.remove('warning', 'danger', 'critical');
+        indicator.className = 'alert-status-indicator';
+
+        if (!highest) {
+            indicator.classList.add('alert-green');
+            statusText.textContent = '状态正常';
+            statusText.style.color = '#2ecc71';
+        } else {
+            const colorMap = {
+                warning: { class: 'alert-yellow', text: '存在警告', color: '#f1c40f' },
+                danger: { class: 'alert-orange', text: '危险状态', color: '#e67e22' },
+                critical: { class: 'alert-red', text: '严重危急', color: '#e74c3c' }
+            };
+            const style = colorMap[highest.level];
+            indicator.classList.add(style.class);
+            statusText.textContent = `${highest.icon} ${style.text} (${currentAlerts.length}项)`;
+            statusText.style.color = style.color;
+            panel.classList.add(highest.level);
+        }
+
+        countNum.textContent = todayAlertCount;
+        this.renderAlertHistory();
+    }
+
+    renderAlertHistory() {
+        const container = document.getElementById('alertHistory');
+        const history = this.gameState.alertHistory;
+
+        if (history.length === 0) {
+            container.innerHTML = '<p style="color:#888; text-align:center; padding:15px; font-size:12px">暂无预警记录</p>';
+            return;
+        }
+
+        container.innerHTML = '';
+        history.slice(0, 15).forEach(record => {
+            const item = document.createElement('div');
+            item.className = `alert-item ${record.level}`;
+            
+            const time = new Date(record.timestamp);
+            const timeStr = `${time.getHours().toString().padStart(2, '0')}:${time.getMinutes().toString().padStart(2, '0')}`;
+            
+            item.innerHTML = `
+                <div class="alert-header">
+                    <span class="alert-title">${record.icon} ${record.levelName} · ${record.action}</span>
+                    <span class="alert-time">第${record.day}天 ${timeStr}</span>
+                </div>
+                <div class="alert-action">${record.actionDesc}</div>
+                <div class="alert-message">${record.message}</div>
+                <div class="alert-details">${record.details}</div>
+            `;
+            container.appendChild(item);
+        });
+    }
+
+    updateEndDayButtonAlert() {
+        const btn = document.getElementById('endDayBtn');
+        const { status, thresholds, resources, schedule } = this.gameState;
+        
+        btn.classList.remove('btn-risk-highlight', 'warning', 'danger', 'critical');
+        
+        const currentAlerts = this.getCurrentAlerts(status, thresholds);
+        
+        const dayPreview = this.estimateDayEndEffects();
+        const endAlerts = this.getCurrentAlerts(dayPreview.status, thresholds);
+        
+        const levelOrder = { warning: 1, danger: 2, critical: 3 };
+        const allAlerts = [...currentAlerts, ...endAlerts];
+        
+        let highestLevel = null;
+        allAlerts.forEach(a => {
+            if (!highestLevel || levelOrder[a.level] > levelOrder[highestLevel]) {
+                highestLevel = a.level;
+            }
+        });
+
+        const scheduleEmpty = !schedule.morning && !schedule.afternoon && !schedule.evening;
+        const foodShortage = resources.food < this.gameState.survivors.length;
+        
+        if (highestLevel || scheduleEmpty || foodShortage) {
+            let riskLevel = highestLevel || 'warning';
+            if (foodShortage && levelOrder[riskLevel] < levelOrder['danger']) {
+                riskLevel = 'danger';
+            }
+            btn.classList.add('btn-risk-highlight', riskLevel);
+        }
+    }
+
+    estimateDayEndEffects() {
+        const { status, schedule, survivors, rumors, thresholds, resources } = this.gameState;
+        const simulated = { ...status };
+        
+        let totalPowerUsed = 0;
+        ['morning', 'afternoon', 'evening'].forEach(slot => {
+            const programId = schedule[slot];
+            if (programId) {
+                const program = GameData.programTypes.find(p => p.id === programId);
+                if (program) {
+                    totalPowerUsed += program.power;
+                    Object.entries(program.effects).forEach(([k, v]) => {
+                        if (simulated[k] !== undefined) {
+                            simulated[k] = Math.max(0, Math.min(100, simulated[k] + v));
+                        }
+                    });
+                }
+            }
+        });
+        simulated.power = Math.max(0, simulated.power - totalPowerUsed);
+
+        survivors.forEach(s => {
+            if (s.fatigue > 0) {
+                simulated.fatigue = Math.max(0, simulated.fatigue - 30);
+            }
+        });
+
+        rumors.forEach(rumor => {
+            simulated.rumor = Math.min(100, simulated.rumor + 5);
+        });
+
+        rumors.forEach(r => {
+            if (r.severity >= 80) {
+                simulated.morale = Math.max(0, simulated.morale - 8);
+            }
+        });
+
+        if (simulated.power <= thresholds.power) {
+            simulated.morale = Math.max(0, simulated.morale - 10);
+        }
+        if (simulated.noise >= thresholds.noise) {
+            simulated.morale = Math.max(0, simulated.morale - 5);
+            simulated.fatigue = Math.min(100, simulated.fatigue + 10);
+        }
+        if (simulated.rumor >= thresholds.rumor) {
+            simulated.morale = Math.max(0, simulated.morale - 15);
+        }
+        if (simulated.fatigue >= thresholds.fatigue) {
+            simulated.morale = Math.max(0, simulated.morale - 5);
+        }
+
+        if (resources.food < survivors.length) {
+            simulated.morale = Math.max(0, simulated.morale - 20);
+        }
+
+        return { status: simulated, powerUsed: totalPowerUsed };
+    }
+
     selectProgram(slot, programId) {
+        const program = GameData.programTypes.find(p => p.id === programId);
+        const slotNames = { morning: '早间时段', afternoon: '午间时段', evening: '晚间时段' };
+        
+        if (program) {
+            this.checkActionAlerts(
+                '节目编排',
+                `${slotNames[slot]}安排「${program.name}」`,
+                this.gameState.status,
+                this.gameState.thresholds,
+                program.effects,
+                program.power
+            );
+        }
+
         this.gameState.schedule[slot] = programId;
         this.renderSchedule();
+        this.updateEndDayButtonAlert();
+        this.renderAlertCenter();
     }
 
     selectBroadcast(broadcastId) {
@@ -524,6 +909,15 @@ class UndergroundRadioGame {
             this.showEvent('电力不足', '电量不足，无法进行播报！', [{ text: '⚡电量不足', type: 'negative' }]);
             return;
         }
+
+        this.checkActionAlerts(
+            '播报消息',
+            `播报「${msg.title}」`,
+            this.gameState.status,
+            this.gameState.thresholds,
+            msg.effects,
+            msg.power
+        );
 
         this.applyEffects(msg.effects);
         this.gameState.status.power -= msg.power;
@@ -562,6 +956,15 @@ class UndergroundRadioGame {
         if (!question) return;
 
         const option = question.options[optionIndex];
+
+        this.checkActionAlerts(
+            '听众问答',
+            `选择回答「${option.text.substring(0, 20)}${option.text.length > 20 ? '...' : ''}」`,
+            this.gameState.status,
+            this.gameState.thresholds,
+            option.effects
+        );
+
         this.applyEffects(option.effects);
         this.gameState.todayActions.qaDone++;
 
@@ -583,7 +986,7 @@ class UndergroundRadioGame {
         this.showEvent(title, option.text, effectTags);
 
         this.generateQuestion();
-        this.renderStatus();
+        this.renderAll();
     }
 
     doRepair() {
@@ -601,6 +1004,15 @@ class UndergroundRadioGame {
             this.showEvent('零件不足', '没有足够的零件进行维修！', [{ text: '🔧零件不足', type: 'negative' }]);
             return;
         }
+
+        const repairEffects = { fatigue: 20 };
+        this.checkActionAlerts(
+            '设备维修',
+            `${survivor.name}维修${equipment.name}`,
+            this.gameState.status,
+            this.gameState.thresholds,
+            repairEffects
+        );
 
         this.gameState.resources.parts -= equipment.repairCost;
         
@@ -632,6 +1044,16 @@ class UndergroundRadioGame {
             this.showEvent('电力不足', '电量不足，无法发布澄清广播！', [{ text: '⚡电量不足', type: 'negative' }]);
             return;
         }
+
+        const suppressEffects = { rumor: -15, fatigue: 10 };
+        this.checkActionAlerts(
+            '谣言压制',
+            `压制谣言「${rumor.title}」`,
+            this.gameState.status,
+            this.gameState.thresholds,
+            suppressEffects,
+            8
+        );
 
         this.gameState.status.power -= 8;
         rumor.severity -= 40;
@@ -708,7 +1130,60 @@ class UndergroundRadioGame {
 
         const survivorCount = this.gameState.survivors.length;
         dayEffects.food -= survivorCount;
-        this.gameState.resources.food += dayEffects.food;
+        const tempFood = this.gameState.resources.food + dayEffects.food;
+
+        let tempFatigueReduction = {};
+        this.gameState.survivors.forEach(s => {
+            if (s.fatigue > 0) {
+                const reduction = Math.min(30, s.fatigue);
+                if (!tempFatigueReduction.fatigue) tempFatigueReduction.fatigue = 0;
+                tempFatigueReduction.fatigue -= reduction;
+            }
+        });
+
+        this.gameState.rumors.forEach(rumor => {
+            dayEffects.rumor += 5;
+        });
+
+        this.gameState.rumors.forEach(r => {
+            if (r.severity + 10 >= 80) {
+                dayEffects.morale -= 8;
+            }
+        });
+
+        if (this.gameState.status.power + dayEffects.power <= this.gameState.thresholds.power) {
+            dayEffects.morale -= 10;
+        }
+        if (this.gameState.status.noise + dayEffects.noise >= this.gameState.thresholds.noise) {
+            dayEffects.morale -= 5;
+            dayEffects.fatigue += 10;
+        }
+        if (this.gameState.status.rumor + dayEffects.rumor >= this.gameState.thresholds.rumor) {
+            dayEffects.morale -= 15;
+        }
+        if (this.gameState.status.fatigue + dayEffects.fatigue + (tempFatigueReduction.fatigue || 0) >= this.gameState.thresholds.fatigue) {
+            dayEffects.morale -= 5;
+        }
+
+        if (tempFood < 0) {
+            dayEffects.morale -= 20;
+        }
+
+        const endDayEffects = { ...dayEffects };
+        Object.keys(tempFatigueReduction).forEach(k => {
+            endDayEffects[k] = (endDayEffects[k] || 0) + tempFatigueReduction[k];
+        });
+        delete endDayEffects.food;
+
+        this.checkActionAlerts(
+            '结束今日',
+            `第${this.gameState.day}天结算`,
+            this.gameState.status,
+            this.gameState.thresholds,
+            endDayEffects
+        );
+
+        this.gameState.resources.food = tempFood;
 
         this.gameState.survivors.forEach(s => {
             if (s.fatigue > 0) {
@@ -721,29 +1196,10 @@ class UndergroundRadioGame {
 
         this.gameState.rumors.forEach(rumor => {
             rumor.severity += 10;
-            dayEffects.rumor += 5;
         });
 
         this.gameState.rumors = this.gameState.rumors.filter(r => r.severity <= 100);
-        this.gameState.rumors.forEach(r => {
-            if (r.severity >= 80) {
-                dayEffects.morale -= 8;
-            }
-        });
 
-        if (this.gameState.status.power <= this.gameState.thresholds.power) {
-            dayEffects.morale -= 10;
-        }
-        if (this.gameState.status.noise >= this.gameState.thresholds.noise) {
-            dayEffects.morale -= 5;
-            dayEffects.fatigue += 10;
-        }
-        if (this.gameState.status.rumor >= this.gameState.thresholds.rumor) {
-            dayEffects.morale -= 15;
-        }
-        if (this.gameState.status.fatigue >= this.gameState.thresholds.fatigue) {
-            dayEffects.morale -= 5;
-        }
         if (this.gameState.status.morale <= this.gameState.thresholds.morale) {
             this.gameState.districts.forEach(d => {
                 d.trust = Math.max(0, d.trust - 5);
@@ -751,7 +1207,6 @@ class UndergroundRadioGame {
         }
 
         if (this.gameState.resources.food < 0) {
-            dayEffects.morale -= 20;
             this.gameState.resources.food = 0;
             this.gameState.survivors.forEach(s => {
                 s.health -= 10;
@@ -787,6 +1242,7 @@ class UndergroundRadioGame {
             repairDone: [],
             rumorSuppressDone: []
         };
+        this.gameState.todayAlertCount = 0;
 
         this.generateDailyRumors();
 

@@ -171,6 +171,24 @@
             </main>
 
             <aside class="right-panel">
+                <div class="panel-section alert-panel" id="alertPanel">
+                    <h3>🚨 实时预警中心</h3>
+                    <div class="alert-status" id="alertStatus">
+                        <span class="alert-status-indicator alert-green" id="alertIndicator"></span>
+                        <span class="alert-status-text" id="alertStatusText">状态正常</span>
+                    </div>
+                    <div class="alert-count" id="alertCount">
+                        <span>今日预警次数: <strong id="alertCountNum">0</strong></span>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <h3>📋 预警记录</h3>
+                    <div class="alert-history" id="alertHistory">
+                        <p style="color:#888; text-align:center; padding:15px; font-size:12px">暂无预警记录</p>
+                    </div>
+                </div>
+
                 <div class="panel-section">
                     <h3>⚠️ 状态阈值</h3>
                     <div class="threshold-list">
