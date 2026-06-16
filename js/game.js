@@ -152,9 +152,14 @@ class UndergroundRadioGame {
                 this.renderStatus();
                 this.renderAlertCenter();
                 this.renderSchedule();
+                this.renderBroadcasts();
+                this.checkRepairRisk();
                 this.updateEndDayButtonAlert();
             });
         });
+
+        document.getElementById('repairEquipment').addEventListener('change', () => this.checkRepairRisk());
+        document.getElementById('repairSurvivor').addEventListener('change', () => this.checkRepairRisk());
 
         document.getElementById('modalCloseBtn').addEventListener('click', () => this.closeModal());
     }
@@ -168,6 +173,14 @@ class UndergroundRadioGame {
 
         if (tabName === 'qa' && !this.gameState.currentQuestion) {
             this.generateQuestion();
+        }
+
+        if (tabName === 'broadcast' && this.gameState.selectedBroadcast) {
+            this.selectBroadcast(this.gameState.selectedBroadcast);
+        }
+
+        if (tabName === 'repair') {
+            this.checkRepairRisk();
         }
     }
 
@@ -353,10 +366,36 @@ class UndergroundRadioGame {
             if (this.gameState.selectedBroadcast === msg.id) {
                 item.classList.add('selected');
             }
+
+            const simulated = this.simulateEffects(this.gameState.status, msg.effects, msg.power);
+            const alerts = this.getCurrentAlerts(simulated, this.gameState.thresholds);
+            const currentAlerts = this.getCurrentAlerts(this.gameState.status, this.gameState.thresholds);
+            const levelOrder = { warning: 1, danger: 2, critical: 3 };
+
+            let newRiskLevel = null;
+            alerts.forEach(a => {
+                const existing = currentAlerts.find(ca => ca.stat === a.stat);
+                if (!existing || levelOrder[a.level] > levelOrder[existing.level]) {
+                    if (!newRiskLevel || levelOrder[a.level] > levelOrder[newRiskLevel]) {
+                        newRiskLevel = a.level;
+                    }
+                }
+            });
+
+            if (newRiskLevel) {
+                item.classList.add(`risk-${newRiskLevel}`);
+            }
+
+            let riskTagHtml = '';
+            if (newRiskLevel) {
+                const riskNames = { warning: '有风险', danger: '高风险', critical: '极危险' };
+                riskTagHtml = `<div class="broadcast-risk-tag ${newRiskLevel}">⚠ ${riskNames[newRiskLevel]}</div>`;
+            }
             
             item.innerHTML = `
                 <div class="broadcast-title">${msg.title}</div>
                 <div class="broadcast-desc">${msg.content}</div>
+                ${riskTagHtml}
             `;
             
             item.addEventListener('click', () => this.selectBroadcast(msg.id));
@@ -407,6 +446,8 @@ class UndergroundRadioGame {
                 select.appendChild(option);
             }
         });
+
+        this.checkRepairRisk();
     }
 
     renderRumors() {
@@ -882,11 +923,94 @@ class UndergroundRadioGame {
         this.renderAlertCenter();
     }
 
+    renderRiskPreview(container, alerts, highest, headerText) {
+        container.style.display = 'block';
+        container.className = `risk-preview ${highest.level}`;
+
+        const itemsHtml = alerts.map(a => {
+            const before = Math.round(this.gameState.status[a.stat]);
+            const after = Math.round(a.value);
+            const change = after - before;
+            const changeStr = change > 0 ? `+${change}` : change;
+            const changeLabel = a.changeType === 'new' ? '新增' : `升级: ${a.fromLevel}→${a.levelName}`;
+            const changeClass = a.changeType === 'new' ? 'new' : 'escalated';
+
+            return `
+                <div class="risk-preview-item ${a.level}">
+                    <span class="risk-preview-stat">${a.icon} ${a.statName}</span>
+                    <span>
+                        <span class="risk-preview-value">${before}</span>
+                        <span class="risk-preview-arrow">→</span>
+                        <span class="risk-preview-value">${after}</span>
+                        <span class="risk-preview-value">(${changeStr})</span>
+                        <span class="risk-preview-change ${changeClass}">${changeLabel}</span>
+                    </span>
+                </div>
+            `;
+        }).join('');
+
+        container.innerHTML = `
+            <div class="risk-preview-header">
+                <span class="risk-preview-icon">${highest.icon}</span>
+                <span>${highest.levelName}预警 - ${headerText}</span>
+            </div>
+            <div class="risk-preview-items">
+                ${itemsHtml}
+            </div>
+        `;
+    }
+
+    checkRepairRisk() {
+        const eqSelect = document.getElementById('repairEquipment');
+        const survivorSelect = document.getElementById('repairSurvivor');
+        const riskPreview = document.getElementById('repairRiskPreview');
+        const btn = document.getElementById('doRepairBtn');
+
+        btn.classList.remove('btn-risk-highlight', 'warning', 'danger', 'critical');
+        riskPreview.style.display = 'none';
+
+        if (!eqSelect.value || !survivorSelect.value) {
+            return;
+        }
+
+        const equipment = this.gameState.equipment.find(e => e.id === eqSelect.value);
+        const survivor = this.gameState.survivors.find(s => s.id === survivorSelect.value);
+
+        if (!equipment || !survivor) return;
+
+        const repairEffects = { fatigue: 20 };
+        const simulated = this.simulateEffects(this.gameState.status, repairEffects);
+        const alerts = this.getCurrentAlerts(simulated, this.gameState.thresholds);
+        const currentAlerts = this.getCurrentAlerts(this.gameState.status, this.gameState.thresholds);
+        const levelOrder = { warning: 1, danger: 2, critical: 3 };
+
+        const worsenedAlerts = [];
+        alerts.forEach(a => {
+            const existing = currentAlerts.find(ca => ca.stat === a.stat);
+            if (!existing) {
+                worsenedAlerts.push({ ...a, changeType: 'new' });
+            } else if (levelOrder[a.level] > levelOrder[existing.level]) {
+                worsenedAlerts.push({ ...a, changeType: 'escalated', fromLevel: existing.levelName });
+            }
+        });
+
+        if (worsenedAlerts.length > 0) {
+            const highest = worsenedAlerts.reduce((h, a) => 
+                levelOrder[a.level] > levelOrder[h.level] ? a : h
+            );
+            btn.classList.add('btn-risk-highlight', highest.level);
+            this.renderRiskPreview(riskPreview, worsenedAlerts, highest, 
+                `派遣${survivor.name}维修${equipment.name}将触发以下预警:`);
+        }
+    }
+
     selectBroadcast(broadcastId) {
         this.gameState.selectedBroadcast = broadcastId;
         
         const msg = GameData.broadcastMessages.find(m => m.id === broadcastId);
         const preview = document.getElementById('broadcastPreview');
+        const riskPreview = document.getElementById('broadcastRiskPreview');
+        const btn = document.getElementById('doBroadcastBtn');
         
         const effectsText = Object.entries(msg.effects)
             .map(([k, v]) => `${this.getStatName(k)} ${v > 0 ? '+' : ''}${v}`)
@@ -897,6 +1021,32 @@ class UndergroundRadioGame {
             <p>${msg.content}</p>
             <p style="color:#888; font-size:12px; margin-top:10px">效果: ${effectsText} | 耗电: ⚡${msg.power}</p>
         `;
+
+        btn.classList.remove('btn-risk-highlight', 'warning', 'danger', 'critical');
+        const simulated = this.simulateEffects(this.gameState.status, msg.effects, msg.power);
+        const alerts = this.getCurrentAlerts(simulated, this.gameState.thresholds);
+        const currentAlerts = this.getCurrentAlerts(this.gameState.status, this.gameState.thresholds);
+        const levelOrder = { warning: 1, danger: 2, critical: 3 };
+
+        const worsenedAlerts = [];
+        alerts.forEach(a => {
+            const existing = currentAlerts.find(ca => ca.stat === a.stat);
+            if (!existing) {
+                worsenedAlerts.push({ ...a, changeType: 'new' });
+            } else if (levelOrder[a.level] > levelOrder[existing.level]) {
+                worsenedAlerts.push({ ...a, changeType: 'escalated', fromLevel: existing.levelName });
+            }
+        });
+
+        if (worsenedAlerts.length > 0) {
+            const highest = worsenedAlerts.reduce((h, a) => 
+                levelOrder[a.level] > levelOrder[h.level] ? a : h
+            );
+            btn.classList.add('btn-risk-highlight', highest.level);
+            this.renderRiskPreview(riskPreview, worsenedAlerts, highest, '播报此消息将触发以下预警:');
+        } else {
+            riskPreview.style.display = 'none';
+        }
         
         this.renderBroadcasts();
     }
